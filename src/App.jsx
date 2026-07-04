@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 
 // ─── VALKYRIE 365 — Paul Carter Inspired ──────────────────────────────────────
 // 5-day split: Mon=Lower A, Tue=Upper Push, Wed=Lower B, Thu=Upper Pull, Fri=Glute Special
@@ -183,6 +183,148 @@ const LS = {
   setRaw: (k,v)=> { try { localStorage.setItem(k, v); } catch {} },
 };
 
+// ─── PROGRESSIVE LOAD SUGGESTION ──────────────────────────────────────────────
+function baseMovement(name) {
+  let s = String(name).replace(/\([^)]*\)/g, " ").toLowerCase();
+  s = s.replace(/\bbb\b/g, "barbell").replace(/\bdb\b/g, "dumbbell");
+  s = s.replace(/\b(heavy|slow|paused|pause|tempo|drop\s*set|drop|rest-pause|restpause|mechanical|mech|triple|double|1\.5-rep|21s|eccentric|ecc|deficit|hold|explosive|max|light)\b/gi, " ");
+  s = s.replace(/\b\d+(\.\d+)?[- ]?(sec|rep|reps|s)\b/gi, " ");
+  s = s.replace(/[-]/g, " ").replace(/\s+/g, " ").trim();
+  return s;
+}
+function parseRepTarget(repStr) {
+  const m = String(repStr).match(/(\d+)\s*-\s*(\d+)/);
+  if (m) return { low: parseInt(m[1]), high: parseInt(m[2]) };
+  const s = String(repStr).match(/(\d+)/);
+  return s ? { low: parseInt(s[1]), high: parseInt(s[1]) } : { low: 8, high: 12 };
+}
+function isCompoundLift(name) {
+  return /Bench|Squat|Press|Row|Deadlift|RDL|Pull-Up|Chin-Up|Pulldown|Hip Thrust|Leg Press|Hack|Dip|Lunge|Split Squat|Landmine|Good Morning|Sumo|Back Extension/i.test(name);
+}
+function findLastPerformance(allWeights, exerciseName, currentWeek, sessionsGetter) {
+  const targetBase = baseMovement(exerciseName);
+  for (let wk = currentWeek - 1; wk >= 1; wk--) {
+    for (const sess of ["A","B","C","D","E"]) {
+      const wo = sessionsGetter(sess, wk);
+      if (!wo) continue;
+      const idx = wo.exercises.findIndex(e => baseMovement(e.exercise) === targetBase);
+      if (idx === -1) continue;
+      const entry = allWeights[`w${wk}_${sess}_${idx}`];
+      if (!entry?.sets) continue;
+      const logged = entry.sets.filter(s => s?.weight && parseFloat(s.weight) > 0);
+      if (logged.length === 0) continue;
+      const weightsUsed = logged.map(s => parseFloat(s.weight));
+      const repsArr     = logged.map(s => parseInt(s.reps) || 0).filter(r => r > 0);
+      return {
+        week: wk,
+        topWeight: Math.max(...weightsUsed),
+        minReps: repsArr.length ? Math.min(...repsArr) : 0,
+      };
+    }
+  }
+  return null;
+}
+function suggestNextWeight(last, repStr, exerciseName) {
+  if (!last || !last.topWeight) return null;
+  const { low, high } = parseRepTarget(repStr);
+  const compound = isCompoundLift(exerciseName);
+  const inc = compound ? 5 : 2.5;
+  const w = last.topWeight;
+  if (last.minReps >= high) return { weight: w + 5, note: `Last: ${w} lb × ${last.minReps}+ (wk ${last.week}). Hit the top — add 5 lb.` };
+  if (last.minReps >= low)  return { weight: w + inc, note: `Last: ${w} lb × ${last.minReps} reps (wk ${last.week}). In range — try +${inc} lb or add a rep.` };
+  if (last.minReps > 0)     return { weight: w, note: `Last: ${w} lb × ${last.minReps} reps (wk ${last.week}). Below target — repeat ${w} lb, aim for ${low}+.` };
+  return { weight: w, note: `Last logged ${w} lb (wk ${last.week}).` };
+}
+
+// ─── REST TIMER ───────────────────────────────────────────────────────────────
+// Parses the upper bound from rest text like "Rest 2-3 min — ..." or "Rest 60-90 sec"
+function restTextToSeconds(text) {
+  const t = String(text).toLowerCase();
+  const isMin = /min/.test(t);
+  const nums = (t.match(/\d+/g) || []).map(Number);
+  if (nums.length === 0) return 90;
+  const val = Math.max(...nums); // upper bound = full recovery
+  return isMin ? val * 60 : val;
+}
+function fmtTime(s) {
+  const m = Math.floor(s / 60), sec = s % 60;
+  return m > 0 ? `${m}:${String(sec).padStart(2,"0")}` : `${sec}s`;
+}
+function RestTimer({ seconds, color }) {
+  const [remaining, setRemaining] = useState(null);
+  const [running, setRunning] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (running && remaining > 0) {
+      ref.current = setTimeout(() => setRemaining(r => r - 1), 1000);
+    } else if (running && remaining === 0) {
+      setRunning(false);
+      try { if (navigator.vibrate) navigator.vibrate([200,100,200]); } catch {}
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx) { const ac = new Ctx(); const o = ac.createOscillator(); const g = ac.createGain();
+          o.connect(g); g.connect(ac.destination); o.frequency.value = 880; o.start();
+          g.gain.setValueAtTime(0.15, ac.currentTime); g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.5);
+          o.stop(ac.currentTime + 0.5); }
+      } catch {}
+    }
+    return () => clearTimeout(ref.current);
+  }, [running, remaining]);
+
+  const start = () => { setRemaining(seconds); setRunning(true); };
+  const stop  = () => { setRunning(false); setRemaining(null); clearTimeout(ref.current); };
+
+  if (remaining === null) {
+    return (
+      <button onClick={start}
+        style={{ display:"flex", alignItems:"center", gap:6, background:"#fff", border:`1.5px solid ${color}`, color, borderRadius:8, padding:"7px 12px", cursor:"pointer", fontSize:12, fontFamily:"inherit", fontWeight:700 }}>
+        ⏱ Start rest timer ({fmtTime(seconds)})
+      </button>
+    );
+  }
+  const done = remaining === 0;
+  return (
+    <button onClick={stop}
+      style={{ display:"flex", alignItems:"center", gap:8, width:"100%", justifyContent:"center",
+        background: done ? "#22c55e" : color, border:"none", color:"#fff",
+        borderRadius:8, padding:"9px 12px", cursor:"pointer", fontSize:15, fontFamily:"inherit", fontWeight:800 }}>
+      {done ? "✓ Rest done — tap to reset" : `⏱ ${fmtTime(remaining)}  ·  tap to stop`}
+    </button>
+  );
+}
+
+// ─── BACKUP / RESTORE ─────────────────────────────────────────────────────────
+const APP_KEY_PREFIX = "val_";
+function exportBackup() {
+  const data = {};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(APP_KEY_PREFIX)) data[k] = localStorage.getItem(k);
+    }
+  } catch {}
+  const blob = new Blob([JSON.stringify({ app:"valkyrie365", exported:new Date().toISOString(), data }, null, 2)], { type:"application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `valkyrie365-backup-${new Date().toISOString().slice(0,10)}.json`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function importBackup(file, onDone) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const parsed = JSON.parse(e.target.result);
+      const data = parsed.data || parsed;
+      Object.entries(data).forEach(([k, v]) => { if (k.startsWith(APP_KEY_PREFIX)) localStorage.setItem(k, v); });
+      onDone(true);
+    } catch { onDone(false); }
+  };
+  reader.onerror = () => onDone(false);
+  reader.readAsText(file);
+}
+
 export default function App() {
   const [currentWeek, setCurrentWeek] = useState(() => parseInt(LS.get("val_week") || "1"));
   const [weights, setWeights]         = useState(() => LS.get("val_weights")   || {});
@@ -213,6 +355,14 @@ export default function App() {
             <div style={S.sublogo}>Ashley · 5-Day Split · Paul Carter Inspired</div>
           </div>
           <button onClick={() => setView("progress")} style={{ ...S.progressBtn, borderColor: phase.color+"44", color: phase.color }}>📈 Progress</button>
+        </div>
+        <div style={{ display:"flex", gap:8, marginTop:12 }}>
+          <button onClick={exportBackup} style={{ flex:1, background:"#fff", border:"1px solid #e5e7eb", color:"#6b7280", padding:"8px", borderRadius:8, cursor:"pointer", fontSize:12, fontFamily:"inherit", fontWeight:600 }}>⬇ Backup my data</button>
+          <label style={{ flex:1, background:"#fff", border:"1px solid #e5e7eb", color:"#6b7280", padding:"8px", borderRadius:8, cursor:"pointer", fontSize:12, fontWeight:600, textAlign:"center" }}>
+            ⬆ Restore
+            <input type="file" accept="application/json" style={{ display:"none" }}
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) importBackup(f, (ok) => { if (ok) { window.location.reload(); } else { alert("Could not read that backup file."); } }); }} />
+          </label>
         </div>
       </div>
 
@@ -327,6 +477,7 @@ function WorkoutView({ weekNum, session, weights, onSaveWeights, onComplete, com
   const getSD = (ei, si) => weights[getKey(ei)]?.sets?.[si] || { weight:"", reps:"" };
   const nSets = (s) => { const m = s.match(/(\d+)/); return m ? parseInt(m[1]) : 3; };
   const isBW  = (n) => ["Pallof","Plank","Dead Bug","McGill","Glute Bridge (banded","Cable Face Pull","Band Pull"].some(k => n.includes(k));
+  const suggestionFor = (exItem) => suggestNextWeight(findLastPerformance(weights, exItem.exercise, weekNum, getWorkout), exItem.reps, exItem.exercise);
 
   if (!workout) return null;
 
@@ -371,13 +522,29 @@ function WorkoutView({ weekNum, session, weights, onSaveWeights, onComplete, com
                 </div>
               </div>
 
-              <div style={{ background:"#fafafa", padding:"8px 14px", borderBottom:"1px solid #f3f4f6", display:"flex", alignItems:"center", gap:8 }}>
-                <span style={{ fontSize:15 }}>⏱</span>
-                <span style={{ fontSize:12, color:"#4b5563", fontWeight:500 }}>{restText}</span>
+              <div style={{ background:"#fafafa", padding:"10px 14px", borderBottom:"1px solid #f3f4f6" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                  <span style={{ fontSize:15 }}>⏱</span>
+                  <span style={{ fontSize:12, color:"#4b5563", fontWeight:500 }}>{restText}</span>
+                </div>
+                <RestTimer seconds={restTextToSeconds(restText)} color={color} />
               </div>
 
               {!bw ? (
                 <div style={{ padding:"10px 14px 2px" }}>
+                  {(() => {
+                    const sug = suggestionFor(exItem);
+                    if (!sug) return null;
+                    return (
+                      <div style={{ display:"flex", alignItems:"center", gap:8, background:"#f0fdf4", border:"1px solid #86efac", borderRadius:8, padding:"8px 10px", marginBottom:10 }}>
+                        <span style={{ fontSize:15 }}>📈</span>
+                        <div style={{ flex:1 }}>
+                          <div style={{ fontSize:13, fontWeight:700, color:"#15803d" }}>Suggested: {sug.weight} lb</div>
+                          <div style={{ fontSize:11, color:"#4b5563", lineHeight:1.4, marginTop:2 }}>{sug.note}</div>
+                        </div>
+                      </div>
+                    );
+                  })()}
                   <div style={{ display:"grid", gridTemplateColumns:"28px 1fr 1fr", gap:8, marginBottom:6 }}>
                     <span style={{ fontSize:10, color:"#9ca3af", fontWeight:600 }}>SET</span>
                     <span style={{ fontSize:10, color:"#9ca3af", fontWeight:600 }}>WEIGHT (lbs)</span>
